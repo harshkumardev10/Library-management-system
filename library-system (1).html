@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Gyan Kunj Library – Management System</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f4f8; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+@keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:none} }
+input:focus, select:focus { border-color: #3b82f6 !important; box-shadow: 0 0 0 3px rgba(59,130,246,.15); }
+button:hover { opacity: .88; }
+tr:hover td { background: #f8fafc; }
+::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner { width:32px;height:32px;border:3px solid #e2e8f0;border-top-color:#3b82f6;border-radius:50%;animation:spin .7s linear infinite;margin:0 auto; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+// ── IN-MEMORY DATABASE ────────────────────────────────────────────────────────
+// ── GOOGLE SHEETS URL (hardcoded) ────────────────────────────────────────────
+const SHEET_URL = 'https://script.google.com/macros/s/AKfycbw9ir59IyN_6VcykYxxmCnnWOprZHMRLXefHDgsDci47fU1aAO6qexQLj2CCofEVFMC/exec';
+
+// ── API → Google Sheets via GET (CORS-safe) ───────────────────────────────────
+// ── LOCAL STORAGE FALLBACK ──────────────────────────────────────────────────
+const LOCAL_KEY = 'sn_local_db';
+const getLocalDB = () => {
+  try {
+    const raw = localStorage.getItem(LOCAL_KEY);
+    if (!raw) return { students: [], seats: [] };
+    const parsed = JSON.parse(raw);
+    return { students: Array.isArray(parsed.students) ? parsed.students : [], seats: Array.isArray(parsed.seats) ? parsed.seats : [] };
+  } catch (e) {
+    console.error('Local DB Corrupted, resetting...', e);
+    return { students: [], seats: [] };
+  }
+};
+const saveLocalDB = (db) => {
+  try {
+    localStorage.setItem(LOCAL_KEY, JSON.stringify(db));
+  } catch (e) {
+    console.error('Failed to save to local storage', e);
+  }
+};
+
+async function sheetCall(action, data = {}) {
+  const params = new URLSearchParams({ action, data: JSON.stringify(data) });
+  try {
+    const res = await fetch(`${SHEET_URL}?${params}`, { 
+      method: 'GET',
+      redirect: 'follow'
+    });
+    
+    // Check if we got a valid response
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    
+    const json = await res.json();
+    console.log(`API Response (${action}):`, json);
+    
+    if (!json.ok) throw new Error(json.error || 'Server error');
+    
+    // Flexible data extraction (handles {data: [...]} or {data: {students: [...]}})
+    let extractedData = json.data;
+    if (action === 'students' && extractedData && !Array.isArray(extractedData) && extractedData.students) {
+      extractedData = extractedData.students;
+    }
+    
+    // Success: Update local cache
+    if (action === 'students' && extractedData) {
+      const db = getLocalDB();
+      db.students = extractedData;
+      saveLocalDB(db);
+    }
+    
+    return extractedData;
+  } catch (err) {
+    console.error(`API Error (${action}):`, err);
+    if (action === 'students' || action === 'seats' || action === 'dashboard' || action === 'fees') {
+      window._isOffline = true;
+      const db = getLocalDB();
+      if (action === 'students') return db.students;
+      
+      const students = db.students || [];
+      if (action === 'seats') {
+         return Array.from({length:50}, (_,i) => {
+            const sn = i + 1;
+            const student = students.find(s => Number(s.seatNumber) === sn);
+            return { seatNumber: sn, status: student ? 'occupied' : 'free', student };
+         });
+      }
+      if (action === 'dashboard') {
+         const occupied = students.length;
+         return { 
+           totalStudents: occupied, 
+           freeSeats: Math.max(0, 50 - occupied), 
+           occupiedSeats: occupied, 
+           feePaidStudents: students.filter(s=>s.feeStatus==='paid').length, 
+           feePendingStudents: students.filter(s=>s.feeStatus!=='paid').length 
+         };
+      }
+      if (action === 'fees') {
+         const paid = students.filter(s=>s.feeStatus==='paid');
+         const pending = students.filter(s=>s.feeStatus!=='paid');
+         return { 
+           students, paid, pending, 
+           totalCollection: paid.reduce((a,b)=>a+Number(b.monthlyFee||0),0), 
+           pendingAmount: pending.reduce((a,b)=>a+Number(b.monthlyFee||0),0) 
+         };
+      }
+    }
+    
+    if (action === 'addStudent' || action === 'editStudent' || action === 'deleteStudent') {
+      const db = getLocalDB();
+      const studentData = typeof data === 'string' ? JSON.parse(data) : data;
+      if (action === 'addStudent') {
+        db.students.push({ ...studentData, id: 'local_' + Date.now() });
+      } else if (action === 'editStudent') {
+        db.students = (db.students || []).map(s => s.id === studentData.id ? { ...s, ...studentData } : s);
+      } else if (action === 'deleteStudent') {
+        const id = studentData.id || studentData;
+        db.students = (db.students || []).filter(s => s.id !== id);
+      }
+      saveLocalDB(db);
+      window._isOffline = true;
+      return { ok: true, info: 'Local save' };
+    }
+    
+    throw err;
+  }
+}
+
+const api = {
+  login({ username, password }) {
+    if (username === 'admin' && password === 'admin123') return Promise.resolve({ token: 'ok' });
+    return Promise.resolve({ error: 'Invalid credentials' });
+  },
+  dashboard()            { return sheetCall('dashboard'); },
+  seats()                { return sheetCall('seats'); },
+  students()             { return sheetCall('students'); },
+  fees()                 { return sheetCall('fees'); },
+  addStudent(data)       { return sheetCall('addStudent', data); },
+  editStudent(id, data)  { return sheetCall('editStudent', { ...data, id }); },
+  deleteStudent(student) { 
+    const id = typeof student === 'object' ? student.id : student;
+    const seat = typeof student === 'object' ? student.seatNumber : null;
+    return sheetCall('deleteStudent', { id, seatNumber: seat }); 
+  },
+};
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function initials(name) {
+  if (!name) return '??';
+  return name.trim().split(/\s+/).map(w => w[0]).filter(Boolean).join('').slice(0, 2).toUpperCase();
+}
+
+
+// ── LOADING SPINNER ───────────────────────────────────────────────────────────
+function Loading({ text }) {
+  return (
+    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:60, gap:16 }}>
+      <div className="spinner" />
+      <p style={{ color:'#94a3b8', fontSize:13 }}>{text || 'Loading...'}</p>
+    </div>
+  );
+}
+
+// ── COMPONENTS ────────────────────────────────────────────────────────────────
+const PAGES = { dashboard: 'Dashboard', seats: 'Seat Availability', students: 'Student Records', fees: 'Fee Tracker' };
+
+function App() {
+  const [auth, setAuth] = useState(!!localStorage.getItem('sn_auth'));
+  const [page, setPage] = useState('dashboard');
+  const [dashData, setDashData] = useState(null);
+  const [allSeats, setAllSeats] = useState([]);
+  const [students, setStudents] = useState([]);
+  const [feeData, setFeeData] = useState(null);
+  const [search, setSearch] = useState('');
+  const [feeSearch, setFeeSearch] = useState('');
+  const [feeTab, setFeeTab] = useState('all');
+  const [modal, setModal] = useState(null);
+  const [formFields, setFormFields] = useState({});
+  const [freeSeats, setFreeSeats] = useState([]);
+  const [formErr, setFormErr] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [globalErr, setGlobalErr] = useState('');
+
+  async function safeFetch(fn) {
+    setLoading(true); setGlobalErr('');
+    try {
+      const res = await fn();
+      return res;
+    }
+    catch(e) {
+      console.error(e);
+      setGlobalErr(e.message || 'Connection error — check your Google Sheet deployment.');
+    }
+    finally { setLoading(false); }
+  }
+
+  const refreshAll = useCallback(async () => {
+    const db = getLocalDB();
+    
+    // 1. Immediately update UI with local data (Instant)
+    if (db.students && db.students.length > 0) {
+      setStudents([...db.students]);
+    }
+
+    // 2. Start background sync (Non-blocking)
+    setLoading(true); setGlobalErr('');
+    try {
+      const serverSt = await Promise.race([
+        api.students(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('Timeout')), 6000))
+      ]).catch(() => null);
+
+      // 3. Smart Merge: Only overwrite if server has actual data
+      if (serverSt && Array.isArray(serverSt) && serverSt.length >= db.students.length) {
+        setStudents(serverSt);
+      } else if (!serverSt && db.students.length > 0) {
+        window._isOffline = true;
+      }
+      
+      // Fetch others in parallel
+      const [d, s, f] = await Promise.all([
+        api.dashboard().catch(() => null),
+        api.seats().catch(() => null),
+        api.fees().catch(() => null)
+      ]);
+
+      if (d) setDashData(d);
+      if (s) setAllSeats(s);
+      if (f) setFeeData(f);
+
+      if (window._isOffline) {
+        setGlobalErr('Connected locally. Syncing in background...');
+      }
+    } catch(e) {
+      console.warn('Background sync issue:', e);
+      window._isOffline = true;
+      setGlobalErr('Limited Connection. Using local data.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const loadPage = useCallback(async (p) => {
+    // If we have local data, don't show the big loading spinner, just refresh in background
+    const db = getLocalDB();
+    if (db.students.length > 0) {
+      setStudents(db.students);
+      // Quickly calculate seats/dash if they aren't there
+      if (!allSeats.length) {
+        const mockSeats = Array.from({length:50}, (_,i)=>({seatNumber:i+1, status: db.students.find(s=>Number(s.seatNumber)===i+1)?'occupied':'free'}));
+        setAllSeats(mockSeats);
+      }
+    } else {
+      setLoading(true);
+    }
+    
+    setGlobalErr('');
+    try {
+      if (p === 'dashboard') {
+        if (!window._isOffline) {
+          const d = await api.dashboard().catch(() => null);
+          if (d && d.totalStudents !== undefined) setDashData(d);
+        } else {
+          setDashData(null); // Force local calculation in render
+        }
+      }
+      if (p === 'seats' || p === 'dashboard') {
+        const s = await api.seats().catch(() => null);
+        if (s) setAllSeats(s);
+      }
+      if (p === 'students') {
+        const st = await api.students().catch(() => null);
+        if (st && st.length > 0) setStudents(st);
+      }
+      if (p === 'fees') {
+        const f = await api.fees().catch(() => null);
+        if (f) setFeeData(f);
+      }
+    } finally {
+      setLoading(false);
+      if (window._isOffline) setGlobalErr('Showing local data (Offline).');
+    }
+  }, [allSeats.length]);
+
+  useEffect(() => { if (auth) loadPage(page); }, [auth, page]);
+
+  async function login(u, p) {
+    const r = await api.login({ username: u, password: p });
+    if (r.token) { localStorage.setItem('sn_auth', '1'); setAuth(true); }
+    else throw new Error('Invalid credentials');
+  }
+  function logout() { localStorage.removeItem('sn_auth'); setAuth(false); }
+
+  async function openAdd(seatOrEvent) {
+    // Check if we got a seat number or a React event
+    const initialSeatNumber = (seatOrEvent && (typeof seatOrEvent === 'number' || typeof seatOrEvent === 'string')) ? seatOrEvent : null;
+    
+    let seats = await safeFetch(() => api.seats());
+    if (!seats) seats = allSeats; // Fallback to currently known seats
+    
+    let free = (seats || []).filter(s => s.status === 'free');
+    
+    // Ensure initial seat is included even if status check is tight
+    if (initialSeatNumber && !free.some(s => Number(s.seatNumber) === Number(initialSeatNumber))) {
+      free.push({ seatNumber: initialSeatNumber, status: 'free' });
+      free.sort((a,b) => a.seatNumber - b.seatNumber);
+    }
+    
+    setFreeSeats(free);
+    setFormFields({ 
+      feeStatus: 'pending', 
+      seatNumber: initialSeatNumber ? String(initialSeatNumber) : '',
+      joinDate: new Date().toISOString().split('T')[0]
+    });
+    setFormErr('');
+    setModal({ type: 'form' });
+  }
+
+  async function openEdit(student) {
+    let seats = await safeFetch(() => api.seats());
+    if (!seats) seats = allSeats;
+    
+    const free = (seats || []).filter(s => s.status === 'free' || Number(s.seatNumber) === Number(student.seatNumber));
+    setFreeSeats(free);
+    setFormFields({ ...student });
+    setFormErr('');
+    setModal({ type: 'form', editId: student.id });
+  }
+
+  async function saveStudent() {
+    const { name, phone, address, joinDate, seatNumber, monthlyFee, feeSubmissionDate, feeStatus } = formFields;
+    if (!name || !name.trim()) { setFormErr('Name is required.'); return; }
+    if (!phone || !phone.trim()) { setFormErr('Phone is required.'); return; }
+    if (!seatNumber) { setFormErr('Please select a seat.'); return; }
+    
+    const payload = { 
+      name: name.trim(), 
+      phone: phone.trim(), 
+      address: address || '', 
+      joinDate: joinDate || '', 
+      seatNumber: Number(seatNumber), 
+      monthlyFee: Number(monthlyFee || 0), 
+      feeSubmissionDate: feeSubmissionDate || '', 
+      feeStatus: feeStatus || 'pending' 
+    };
+
+    setLoading(true);
+    try {
+      // 1. Update server (or local fallback inside api.addStudent)
+      if (modal.editId) await api.editStudent(modal.editId, payload);
+      else await api.addStudent(payload);
+      
+      // 2. FORCE immediate local update so UI reflects change now
+      const db = getLocalDB();
+      setStudents([...db.students]);
+      
+      // 3. Clear modal
+      setModal(null);
+      
+      // 4. Trigger a full refresh across all pages
+      await refreshAll();
+    } catch (e) {
+ 
+      setFormErr(e.message); 
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function deleteStudent(studentOrId) {
+    if (!window.confirm('Are you sure you want to delete this student record? This action cannot be undone.')) return;
+    const id = typeof studentOrId === 'object' ? studentOrId.id : studentOrId;
+    
+    setLoading(true);
+    try {
+      await api.deleteStudent(studentOrId);
+      
+      // Update local state immediately
+      const db = getLocalDB();
+      db.students = (db.students || []).filter(s => s.id !== id);
+      saveLocalDB(db);
+      setStudents(db.students);
+      
+      setModal(null);
+      await refreshAll();
+    } catch(e) {
+      alert('Failed to delete: ' + e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (!auth) return <LoginPage onLogin={login} />;
+
+  const occupied = (allSeats || []).filter(s => s.status === 'occupied').length;
+  const filteredStudents = (students || []).filter(s =>
+    !search || 
+    (s.name && s.name.toLowerCase().includes(search.toLowerCase())) ||
+    (s.phone && s.phone.includes(search)) || 
+    (s.seatNumber && String(s.seatNumber).includes(search))
+  );
+
+  return (
+    <div style={{ display: 'flex', minHeight: '100vh' }}>
+      <Sidebar page={page} setPage={p => { setPage(p); setSearch(''); setFeeSearch(''); }} onLogout={logout} />
+      <div style={{ marginLeft: 220, flex: 1, display: 'flex', flexDirection: 'column' }}>
+        <TopBar title={PAGES[page]} onLogout={logout} loading={loading} />
+        <div style={{ padding: 24, flex: 1, animation: 'fadeIn .3s ease' }}>
+
+          {globalErr && (
+            <div style={{ background: '#fffbeb', border: '1px solid #fef3c7', color: '#92400e', padding: 12, borderRadius: 12, marginBottom: 20, fontSize: 13, display:'flex', alignItems:'center', gap:10 }}>
+              <span style={{ fontSize:18 }}>⚠️</span>
+              <div style={{ flex:1 }}>
+                <strong>Limited Connectivity:</strong> {globalErr.includes('fetch') ? 'Using local database mode (Offline).' : globalErr}
+              </div>
+              <button onClick={() => loadPage(page)} style={{ background: '#f59e0b', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 8, cursor: 'pointer', fontSize: 11, fontWeight: 700 }}>Try Sync</button>
+            </div>
+          )}
+
+          {loading && <Loading text="Fetching data from Google Sheets..." />}
+
+          {page === 'dashboard' && (
+            <div style={{ animation: 'fadeIn .4s ease' }}>
+              <p style={{ color: '#64748b', fontSize: 13, marginBottom: 18 }}>Welcome back! Here's your library overview.</p>
+              <StatsGrid d={(window._isOffline || !dashData || dashData.totalStudents === undefined) ? { 
+                totalStudents: students.length, 
+                freeSeats: 50 - students.length, 
+                occupiedSeats: students.length,
+                feePaidStudents: students.filter(s=>s.feeStatus==='paid').length,
+                feePendingStudents: students.filter(s=>s.feeStatus!=='paid').length
+              } : dashData} />
+              <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #e8ecf4', padding: 20, marginTop: 20 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                  <div style={{ fontWeight: 700, fontSize: 15 }}>Quick Seat Overview</div>
+                  <button onClick={() => { setPage('seats'); }} style={{ background: 'none', border: 'none', color: '#3b82f6', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>View All →</button>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(10,1fr)', gap: 6 }}>
+                  {allSeats.length > 0 ? allSeats.map(s => (
+                    <div key={s.seatNumber} onClick={() => { setPage('seats'); }}
+                      title={`Seat ${s.seatNumber} – ${s.status}`}
+                      style={{ aspectRatio: '1', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontWeight: 800, cursor: 'pointer', background: s.status === 'free' ? '#dcfce7' : '#fee2e2', color: s.status === 'free' ? '#166534' : '#991b1b', transition: 'transform .1s' }}
+                      onMouseEnter={e => e.currentTarget.style.transform = 'scale(1.15)'}
+                      onMouseLeave={e => e.currentTarget.style.transform = 'none'}>
+                      {s.status === 'free' ? 'F' : 'O'}
+                    </div>
+                  )) : Array.from({length:50}, (_,i)=>({seatNumber:i+1, status: students.find(st=>Number(st.seatNumber)===i+1)?'occupied':'free'})).map(s => (
+                    <div key={s.seatNumber} onClick={() => { setPage('seats'); }}
+                      style={{ aspectRatio: '1', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontWeight: 800, background: s.status === 'free' ? '#dcfce7' : '#fee2e2', color: s.status === 'free' ? '#166534' : '#991b1b' }}>
+                      {s.status === 'free' ? 'F' : 'O'}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              {!dashData && !loading && !globalErr && <div style={{ textAlign: 'center', padding: 20, color: '#94a3b8', fontSize: 12 }}>Syncing with Google Sheets for latest metrics...</div>}
+            </div>
+          )}
+
+          {page === 'seats' && (
+            <>
+              <div style={{ display: 'flex', gap: 20, padding: '14px 20px', background: '#fff', borderRadius: 12, border: '1px solid #e8ecf4', marginBottom: 20, alignItems: 'center', flexWrap: 'wrap' }}>
+                {[['Total', '50', '#3b82f6'], ['Free', String(50 - occupied), '#22c55e'], ['Occupied', String(occupied), '#ef4444']].map(([l, v, c]) => (
+                  <div key={l} style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 11, color: '#94a3b8', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.5px' }}>{l}</div>
+                    <div style={{ fontSize: 20, fontWeight: 700, color: c }}>{v}</div>
+                  </div>
+                ))}
+                <div style={{ flex: 1 }}></div>
+                <div style={{ display: 'flex', gap: 12, fontSize: 13, color: '#475569' }}><span>🟢 Free</span><span>🔴 Occupied</span></div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(10,1fr)', gap: 8 }}>
+                {(allSeats.length > 0 ? allSeats : Array.from({length:50}, (_,i)=>({seatNumber:i+1, status:'free'}))).map(s => (
+                  <SeatBox key={s.seatNumber} seat={s} onClick={() => {
+                    if (s.student) setModal({ type: 'seat', seat: s });
+                    else openAdd(s.seatNumber);
+                  }} />
+                ))}
+              </div>
+            </>
+          )}
+
+          {page === 'students' && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16, gap: 12 }}>
+                <SearchBox value={search} onChange={setSearch} placeholder="Search by name, phone, seat..." />
+                <button onClick={openAdd} style={{ padding: '8px 18px', background: 'linear-gradient(135deg,#3b82f6,#2563eb)', color: '#fff', border: 'none', borderRadius: 10, cursor: 'pointer', fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap' }}>+ Add Student</button>
+              </div>
+              <StudentTable students={filteredStudents} onRowClick={s => setModal({ type: 'profile', student: s })} onEdit={openEdit} onDelete={deleteStudent} />
+            </>
+          )}
+
+          {page === 'fees' && (
+            feeData ? (
+              <FeeTracker data={feeData} search={feeSearch} setSearch={setFeeSearch} tab={feeTab} setTab={setFeeTab}
+                onRowClick={s => setModal({ type: 'profile', student: s })}
+                onToggle={async (id) => {
+                  const s = feeData.students.find(st => st.id === id);
+                  const newStatus = s.feeStatus === 'paid' ? 'pending' : 'paid';
+                  await api.editStudent(id, { ...s, feeStatus: newStatus, feeSubmissionDate: newStatus === 'paid' ? new Date().toISOString().split('T')[0] : s.feeSubmissionDate });
+                  setFeeData(await api.fees());
+                }}
+              />
+            ) : (!loading && !globalErr && <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8' }}>No fee data found.</div>)
+          )}
+        </div>
+      </div>
+
+      {modal?.type === 'seat' && <SeatModal seat={modal.seat} onClose={() => setModal(null)} onViewProfile={() => setModal({ type: 'profile', student: modal.seat.student })} />}
+      {modal?.type === 'profile' && <ProfileModal student={modal.student} onClose={() => setModal(null)} onEdit={() => openEdit(modal.student)} onDelete={() => deleteStudent(modal.student)} />}
+      {modal?.type === 'form' && (
+        <StudentFormModal
+          fields={formFields}
+          setFields={setFormFields}
+          freeSeats={freeSeats}
+          err={formErr}
+          setErr={setFormErr}
+          onClose={() => setModal(null)}
+          onSave={saveStudent}
+          isEdit={!!modal.editId}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── LOGIN ─────────────────────────────────────────────────────────────────────
+function LoginPage({ onLogin }) {
+  const [u, setU] = useState(''); const [p, setP] = useState(''); const [err, setErr] = useState('');
+  const go = () => onLogin(u, p).catch(e => setErr(e.message));
+  return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'linear-gradient(135deg,#1a1a2e,#16213e,#0f3460)', padding: 20 }}>
+      <div style={{ background: '#fff', borderRadius: 20, padding: 40, width: '100%', maxWidth: 380, boxShadow: '0 25px 60px rgba(0,0,0,.4)' }}>
+        <div style={{ textAlign: 'center', marginBottom: 32 }}>
+          <div style={{ width: 60, height: 60, background: 'linear-gradient(135deg,#3b82f6,#2563eb)', borderRadius: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px', fontSize: 28 }}>📚</div>
+          <h2 style={{ fontSize: 22, fontWeight: 700 }}>Gyan Kunj</h2>
+          <p style={{ color: '#64748b', fontSize: 13 }}>Library Management System</p>
+        </div>
+        <label style={labelStyle}>Username</label>
+        <input value={u} onChange={e => setU(e.target.value)} placeholder="admin" onKeyDown={e => e.key === 'Enter' && go()} style={inputStyle} />
+        <label style={labelStyle}>Password</label>
+        <input type="password" value={p} onChange={e => setP(e.target.value)} placeholder="admin123" onKeyDown={e => e.key === 'Enter' && go()} style={{ ...inputStyle, marginBottom: 8 }} />
+        {err && <p style={{ color: '#ef4444', fontSize: 12, textAlign: 'center', marginBottom: 8 }}>{err}</p>}
+        <button onClick={go} style={{ width: '100%', padding: 12, background: 'linear-gradient(135deg,#3b82f6,#2563eb)', color: '#fff', border: 'none', borderRadius: 10, fontSize: 14, fontWeight: 600, cursor: 'pointer', marginTop: 4 }}>Sign In</button>
+        <p style={{ textAlign: 'center', color: '#94a3b8', fontSize: 12, marginTop: 14 }}>Default: admin / admin123</p>
+      </div>
+    </div>
+  );
+}
+
+const labelStyle = { fontSize: 11, fontWeight: 700, color: '#475569', textTransform: 'uppercase', letterSpacing: '.5px', display: 'block', marginBottom: 5, marginTop: 10 };
+const inputStyle = { width: '100%', padding: '11px 14px', border: '1.5px solid #e2e8f0', borderRadius: 10, fontSize: 14, outline: 'none', background: '#f8fafc', marginBottom: 14 };
+const fieldStyle = { width: '100%', padding: '9px 12px', border: '1.5px solid #e2e8f0', borderRadius: 9, fontSize: 13, outline: 'none', background: '#f8fafc' };
+const fieldLabelStyle = { fontSize: 11, fontWeight: 700, color: '#475569', display: 'block', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '.5px' };
+
+// ── SIDEBAR & TOPBAR ──────────────────────────────────────────────────────────
+function Sidebar({ page, setPage, onLogout }) {
+  const nav = [['dashboard', '🏠', 'Dashboard'], ['seats', '💺', 'Seat Availability'], ['students', '👥', 'Student Records'], ['fees', '💰', 'Fee Tracker']];
+  return (
+    <div style={{ width: 220, background: '#1a1a2e', position: 'fixed', top: 0, left: 0, bottom: 0, zIndex: 10, display: 'flex', flexDirection: 'column' }}>
+      <div style={{ padding: '20px 16px 16px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+        <div style={{ color: '#fff', fontSize: 16, fontWeight: 600 }}>📚 Gyan Kunj</div>
+        <div style={{ color: '#7c8db0', fontSize: 11, marginTop: 2 }}>Library Admin</div>
+      </div>
+      <div style={{ padding: '8px 0', flex: 1 }}>
+        {nav.map(([id, icon, label]) => (
+          <button key={id} onClick={() => setPage(id)}
+            style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px', margin: '1px 8px', borderRadius: 8, cursor: 'pointer', color: page === id ? '#fff' : '#8a9bc0', fontSize: 13, fontWeight: 500, border: 'none', background: page === id ? 'linear-gradient(135deg,#3b82f6,#2563eb)' : 'none', width: 'calc(100% - 16px)', textAlign: 'left', transition: 'all .15s' }}>
+            <span>{icon}</span><span>{label}</span>
+          </button>
+        ))}
+      </div>
+      <div style={{ padding: '8px 8px 16px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+        <a href="https://docs.google.com/spreadsheets" target="_blank" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px', width: '100%', borderRadius: 8, cursor: 'pointer', color: '#8a9bc0', fontSize: 11, fontWeight: 500, textDecoration: 'none', background: 'rgba(255,255,255,0.05)', marginBottom: 8 }}>
+          📂 <span>Google Spreadsheet</span>
+        </a>
+        <button onClick={onLogout} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px', width: '100%', borderRadius: 8, cursor: 'pointer', color: '#8a9bc0', fontSize: 13, fontWeight: 500, border: 'none', background: 'none' }}>🚪 <span>Logout</span></button>
+      </div>
+    </div>
+  );
+}
+
+function TopBar({ title, onLogout, loading }) {
+  return (
+    <div style={{ background: '#fff', padding: '14px 24px', borderBottom: '1px solid #e8ecf4', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0, zIndex: 5, boxShadow: '0 1px 3px rgba(0,0,0,.05)' }}>
+      <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+        <h1 style={{ fontSize: 18, fontWeight: 600, color: '#1a1a2e' }}>{title}</h1>
+        {loading && <div style={{ width:16, height:16, border:'2px solid #e2e8f0', borderTopColor:'#3b82f6', borderRadius:'50%', animation:'spin .7s linear infinite' }} />}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <button onClick={() => {
+           const db = getLocalDB();
+           alert(`Local Stats:\n- Students: ${db.students.length}\n- Offline Mode: ${!!window._isOffline}\n- Storage Size: ${JSON.stringify(db).length} bytes`);
+           console.log('Current DB:', db);
+        }} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', padding: '5px 10px', borderRadius: 8, fontSize: 10, cursor: 'pointer' }}>🛠️ Debug</button>
+        <div style={{ background: '#f0fdf4', color: '#166534', padding: '5px 12px', borderRadius: 20, fontSize: 12, fontWeight: 600 }}>📊 Google Sheets</div>
+        <div style={{ background: '#f0f4ff', color: '#3b82f6', padding: '5px 12px', borderRadius: 20, fontSize: 12, fontWeight: 600 }}>👤 Admin</div>
+        <button onClick={onLogout} style={{ padding: '6px 14px', background: 'none', border: '1px solid #e2e8f0', borderRadius: 8, cursor: 'pointer', fontSize: 12, color: '#64748b' }}>Logout</button>
+      </div>
+    </div>
+  );
+}
+
+// ── STATS GRID ────────────────────────────────────────────────────────────────
+function StatsGrid({ d }) {
+  const cards = [
+    { label: 'Total Seats', val: 50, color: '#3b82f6' },
+    { label: 'Free Seats', val: d?.freeSeats || 0, color: '#22c55e' },
+    { label: 'Occupied Seats', val: d?.occupiedSeats || 0, color: '#ef4444' },
+    { label: 'Total Students', val: d?.totalStudents || 0, color: '#8b5cf6' },
+    { label: 'Fee Paid', val: d?.feePaidStudents || 0, color: '#14b8a6' },
+    { label: 'Fee Pending', val: d?.feePendingStudents || 0, color: '#f59e0b' },
+  ];
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 16 }}>
+      {cards.map(c => (
+        <div key={c.label} style={{ background: '#fff', borderRadius: 14, padding: '18px 20px', border: '1px solid #e8ecf4', borderTop: `3px solid ${c.color}`, boxShadow: '0 2px 4px rgba(0,0,0,.02)' }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '.7px', marginBottom: 8 }}>{c.label}</div>
+          <div style={{ fontSize: 28, fontWeight: 700, color: '#1a1a2e' }}>{c.val}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── SEAT BOX ──────────────────────────────────────────────────────────────────
+function SeatBox({ seat, onClick }) {
+  const free = seat.status === 'free';
+  return (
+    <div onClick={onClick}
+      title={`Seat ${seat.seatNumber} – ${free ? 'Free' : 'Occupied'}${seat.student ? ' (' + seat.student.name + ')' : ''}`}
+      style={{ aspectRatio: '1', borderRadius: 10, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', fontWeight: 700, transition: 'all .15s', background: free ? '#dcfce7' : '#fee2e2', color: free ? '#166534' : '#991b1b', border: `2px solid ${free ? '#bbf7d0' : '#fecaca'}`, userSelect: 'none' }}
+      onMouseEnter={e => { e.currentTarget.style.transform = 'scale(1.08)'; e.currentTarget.style.boxShadow = '0 4px 12px rgba(0,0,0,.12)'; }}
+      onMouseLeave={e => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = 'none'; }}>
+      <span style={{ fontSize: 14, fontWeight: 800 }}>{free ? 'F' : 'O'}</span>
+      <span style={{ fontSize: 9, fontWeight: 600, opacity: .7 }}>#{seat.seatNumber}</span>
+    </div>
+  );
+}
+
+// ── SEARCH BOX ────────────────────────────────────────────────────────────────
+function SearchBox({ value, onChange, placeholder }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', background: '#fff', border: '1.5px solid #e2e8f0', borderRadius: 10, flex: 1, maxWidth: 340 }}>
+      <span style={{ color: '#94a3b8' }}>🔍</span>
+      <input value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+        style={{ border: 'none', outline: 'none', fontSize: 13, color: '#1a1a2e', background: 'transparent', width: '100%' }} />
+      {value && <button onClick={() => onChange('')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8', fontSize: 18, lineHeight: 1 }}>×</button>}
+    </div>
+  );
+}
+
+// ── FEE BADGE ─────────────────────────────────────────────────────────────────
+function FeeBadge({ status }) {
+  return status === 'paid'
+    ? <span style={{ background: '#dcfce7', color: '#166534', padding: '4px 10px', borderRadius: 20, fontSize: 11, fontWeight: 700 }}>✓ Paid</span>
+    : <span style={{ background: '#fee2e2', color: '#991b1b', padding: '4px 10px', borderRadius: 20, fontSize: 11, fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: 5 }}><span style={{ width: 7, height: 7, borderRadius: '50%', background: '#ef4444', display: 'inline-block', animation: 'blink 1.2s infinite' }}></span>Pending</span>;
+}
+
+// ── STUDENT TABLE ─────────────────────────────────────────────────────────────
+function StudentTable({ students, onRowClick, onEdit, onDelete }) {
+  if (!students.length) return <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8' }}>No students found</div>;
+  return (
+    <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #e8ecf4', overflow: 'hidden' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead>
+          <tr>{['Name', 'Seat No.', 'Phone', 'Join Date', 'Fee Status', 'Actions'].map(h =>
+            <th key={h} style={{ background: '#f8fafc', padding: '11px 16px', fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '.7px', textAlign: 'left', borderBottom: '1px solid #e8ecf4' }}>{h}</th>
+          )}</tr>
+        </thead>
+        <tbody>
+          {students.map(s => (
+            <tr key={s.id} onClick={() => onRowClick(s)} style={{ cursor: 'pointer' }}>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9' }}><div style={{ fontWeight: 600 }}>{s.name}</div><div style={{ fontSize: 11, color: '#94a3b8' }}>{s.address}</div></td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9' }}><span style={{ background: '#eff6ff', color: '#1d4ed8', padding: '3px 10px', borderRadius: 6, fontSize: 12, fontWeight: 700 }}>Seat {s.seatNumber}</span></td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9', fontSize: 13 }}>{s.phone}</td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9', fontSize: 13 }}>{s.joinDate || '—'}</td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9' }}><FeeBadge status={s.feeStatus} /></td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9' }} onClick={e => e.stopPropagation()}>
+                <button onClick={() => onEdit(s)} style={{ padding: '5px 10px', background: 'none', border: '1.5px solid #e2e8f0', borderRadius: 8, cursor: 'pointer', color: '#3b82f6', marginRight: 4, fontSize: 12 }}>Edit</button>
+                <button onClick={() => onDelete(s)} style={{ padding: '5px 10px', background: 'none', border: '1.5px solid #fecaca', borderRadius: 8, cursor: 'pointer', color: '#ef4444', fontSize: 12 }}>Delete</button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── FEE TRACKER ───────────────────────────────────────────────────────────────
+function FeeTracker({ data, search, setSearch, tab, setTab, onRowClick, onToggle }) {
+  const list = (data.students || []).filter(s => {
+    const q = search.toLowerCase();
+    const nameMatch = s.name ? s.name.toLowerCase().includes(q) : !q;
+    const seatMatch = s.seatNumber ? String(s.seatNumber).includes(q) : !q;
+    return (nameMatch || seatMatch) && (tab === 'all' || s.feeStatus === tab);
+  });
+  return (<>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 14, marginBottom: 20 }}>
+      {[['Paid Students', data.paid.length, '#22c55e'], ['Pending Students', data.pending.length, '#ef4444'], ['Total Collected', `₹${data.totalCollection.toLocaleString()}`, '#14b8a6'], ['Pending Amount', `₹${data.pendingAmount.toLocaleString()}`, '#f59e0b']].map(([l, v, c]) => (
+        <div key={l} style={{ background: '#fff', borderRadius: 14, padding: '18px 20px', border: '1px solid #e8ecf4', borderTop: `3px solid ${c}` }}>
+          <div style={{ fontSize: 11, color: '#94a3b8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.7px', marginBottom: 8 }}>{l}</div>
+          <div style={{ fontSize: 22, fontWeight: 700 }}>{v}</div>
+        </div>
+      ))}
+    </div>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 2, background: '#f1f5f9', borderRadius: 10, padding: 3 }}>
+        {['all', 'paid', 'pending'].map(t => (
+          <button key={t} onClick={() => setTab(t)} style={{ padding: '7px 18px', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600, background: tab === t ? '#fff' : 'transparent', color: tab === t ? '#3b82f6' : '#64748b', boxShadow: tab === t ? '0 1px 4px rgba(0,0,0,.1)' : 'none', textTransform: 'capitalize', transition: 'all .15s' }}>{t}</button>
+        ))}
+      </div>
+      <SearchBox value={search} onChange={setSearch} placeholder="Name or seat no..." />
+    </div>
+    <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #e8ecf4', overflow: 'hidden' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead><tr>{['Name', 'Seat', 'Monthly Fee', 'Paid On', 'Status', 'Action'].map(h =>
+          <th key={h} style={{ background: '#f8fafc', padding: '11px 16px', fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '.7px', textAlign: 'left', borderBottom: '1px solid #e8ecf4' }}>{h}</th>
+        )}</tr></thead>
+        <tbody>
+          {list.map(s => (
+            <tr key={s.id} onClick={() => onRowClick(s)} style={{ cursor: 'pointer' }}>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9', fontWeight: 600 }}>{s.name}</td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9' }}><span style={{ background: '#eff6ff', color: '#1d4ed8', padding: '2px 8px', borderRadius: 6, fontSize: 12, fontWeight: 700 }}>Seat {s.seatNumber}</span></td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9', fontSize: 13 }}>₹{(s.monthlyFee || 0).toLocaleString()}</td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9', fontSize: 13 }}>{s.feeSubmissionDate || '—'}</td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9' }}><FeeBadge status={s.feeStatus} /></td>
+              <td style={{ padding: '13px 16px', borderBottom: '1px solid #f1f5f9' }} onClick={e => e.stopPropagation()}>
+                <button onClick={() => onToggle(s.id)} style={{ padding: '5px 12px', border: '1.5px solid', borderRadius: 8, cursor: 'pointer', fontSize: 12, fontWeight: 600, background: 'none', color: s.feeStatus === 'paid' ? '#ef4444' : '#22c55e', borderColor: s.feeStatus === 'paid' ? '#fecaca' : '#bbf7d0' }}>
+                  {s.feeStatus === 'paid' ? 'Mark Pending' : 'Mark Paid'}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {!list.length && <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8' }}>No records found</div>}
+    </div>
+  </>);
+}
+
+// ── MODAL SHELL ───────────────────────────────────────────────────────────────
+function Modal({ onClose, title, children, footer }) {
+  return (
+    <div onClick={e => e.target === e.currentTarget && onClose()} style={{ position: 'fixed', inset: 0, background: 'rgba(10,15,30,.55)', zIndex: 1000, display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '40px 16px', overflowY: 'auto', backdropFilter: 'blur(4px)' }}>
+      <div style={{ background: '#fff', borderRadius: 20, width: '100%', maxWidth: 520, overflow: 'hidden', boxShadow: '0 20px 60px rgba(0,0,0,.25)', margin: 'auto', animation: 'fadeIn .2s ease' }}>
+        <div style={{ padding: '20px 24px 16px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <h3 style={{ fontSize: 16, fontWeight: 700 }}>{title}</h3>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 22, color: '#94a3b8', lineHeight: 1 }}>✕</button>
+        </div>
+        <div style={{ padding: '20px 24px' }}>{children}</div>
+        {footer && <div style={{ padding: '16px 24px', background: '#f8fafc', borderTop: '1px solid #f1f5f9', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>{footer}</div>}
+      </div>
+    </div>
+  );
+}
+
+// ── SEAT MODAL ────────────────────────────────────────────────────────────────
+function SeatModal({ seat, onClose, onViewProfile }) {
+  return (
+    <Modal title={`Seat ${seat.seatNumber}`} onClose={onClose}>
+      {seat.student ? (<>
+        <div style={{ textAlign: 'center', marginBottom: 14 }}>
+          <div style={{ width: 56, height: 56, borderRadius: '50%', background: '#dbeafe', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 8px', fontWeight: 800, fontSize: 18, color: '#1d4ed8' }}>{initials(seat.student.name)}</div>
+          <p style={{ fontSize: 16, fontWeight: 700 }}>{seat.student.name}</p>
+          <FeeBadge status={seat.student.feeStatus} />
+        </div>
+        {[['📞', 'Phone', seat.student.phone], ['📍', 'Address', seat.student.address || '—'], ['📅', 'Join Date', seat.student.joinDate || '—'], ['💺', 'Seat No.', `#${seat.student.seatNumber}`], ['💰', 'Monthly Fee', `₹${seat.student.monthlyFee || 0}`]].map(([icon, label, val]) => (
+          <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 0', fontSize: 13, borderBottom: '1px solid #f1f5f9' }}>
+            <span>{icon}</span><span style={{ color: '#64748b', minWidth: 90 }}>{label}</span><span style={{ fontWeight: 600 }}>{val}</span>
+          </div>
+        ))}
+        <button onClick={onViewProfile} style={{ width: '100%', marginTop: 14, padding: 10, background: 'linear-gradient(135deg,#3b82f6,#2563eb)', color: '#fff', border: 'none', borderRadius: 10, cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>View Full Profile</button>
+      </>) : (
+        <div style={{ textAlign: 'center', padding: '20px 0' }}>
+          <p style={{ fontSize: 40, marginBottom: 8 }}>{seat.status === 'free' ? '🟢' : '🔴'}</p>
+          <p style={{ fontSize: 20, fontWeight: 700, color: seat.status === 'free' ? '#166534' : '#991b1b' }}>{seat.status === 'free' ? 'Available' : 'Occupied (No record)'}</p>
+          <p style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>No student assigned</p>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ── PROFILE MODAL ─────────────────────────────────────────────────────────────
+function ProfileModal({ student: s, onClose, onEdit, onDelete }) {
+  return (
+    <Modal title="Student Profile" onClose={onClose} footer={<>
+      <button onClick={onClose} style={{ padding: '8px 16px', border: '1.5px solid #e2e8f0', borderRadius: 10, cursor: 'pointer', background: 'none', color: '#64748b', fontSize: 13 }}>Close</button>
+      <button onClick={() => onDelete(s)} style={{ padding: '8px 16px', border: '1.5px solid #fecaca', borderRadius: 10, cursor: 'pointer', background: 'none', color: '#ef4444', fontSize: 13 }}>Delete</button>
+      <button onClick={onEdit} style={{ padding: '8px 16px', background: 'linear-gradient(135deg,#3b82f6,#2563eb)', color: '#fff', border: 'none', borderRadius: 10, cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>Edit</button>
+    </>}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 18 }}>
+        <div style={{ width: 56, height: 56, borderRadius: '50%', background: '#dbeafe', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 18, color: '#1d4ed8', flexShrink: 0 }}>{initials(s.name)}</div>
+        <div><p style={{ fontSize: 18, fontWeight: 700 }}>{s.name}</p><FeeBadge status={s.feeStatus} /></div>
+        <div style={{ marginLeft: 'auto' }}><div style={{ background: '#eff6ff', color: '#1d4ed8', padding: '6px 14px', borderRadius: 10, fontWeight: 800, fontSize: 15 }}>Seat {s.seatNumber}</div></div>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 14 }}>
+        {[['Phone', s.phone], ['Address', s.address || '—'], ['Join Date', s.joinDate || '—'], ['Monthly Fee', `₹${s.monthlyFee || 0}`], ['Paid On', s.feeSubmissionDate || '—']].map(([l, v]) => (
+          <div key={l}><div style={{ fontSize: 10, color: '#94a3b8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.6px', marginBottom: 3 }}>{l}</div><div style={{ fontSize: 14, fontWeight: 500 }}>{v}</div></div>
+        ))}
+      </div>
+      <div style={{ borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
+        <div style={{ fontWeight: 700, marginBottom: 10 }}>Activity History</div>
+        {!(s.history || []).length && <p style={{ color: '#94a3b8', fontSize: 13 }}>No history yet</p>}
+        {(s.history || []).map((h, i) => (
+          <div key={i} style={{ display: 'flex', gap: 10, paddingBottom: 10, borderBottom: '1px solid #f1f5f9' }}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#3b82f6', marginTop: 4, flexShrink: 0 }}></div>
+            <div><div style={{ fontSize: 13 }}>{h.action}: {h.note}</div><div style={{ fontSize: 11, color: '#94a3b8' }}>{new Date(h.date).toLocaleString()}</div></div>
+          </div>
+        ))}
+      </div>
+    </Modal>
+  );
+}
+
+// ── STUDENT FORM MODAL ────────────────────────────────────────────────────────
+function StudentFormModal({ fields, setFields, freeSeats, err, setErr, onClose, onSave, isEdit }) {
+  function upd(key, val) {
+    setFields(prev => ({ ...prev, [key]: val }));
+    setErr('');
+  }
+
+  return (
+    <Modal title={isEdit ? 'Edit Student' : 'Add New Student'} onClose={onClose} footer={<>
+      <button onClick={onClose} style={{ padding: '8px 16px', border: '1.5px solid #e2e8f0', borderRadius: 10, cursor: 'pointer', background: 'none', color: '#64748b', fontSize: 13 }}>Cancel</button>
+      <button onClick={onSave} style={{ padding: '8px 16px', background: 'linear-gradient(135deg,#3b82f6,#2563eb)', color: '#fff', border: 'none', borderRadius: 10, cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>Save Student</button>
+    </>}>
+
+      <div style={{ marginBottom: 14 }}>
+        <label style={fieldLabelStyle}>Full Name *</label>
+        <input value={fields.name || ''} onChange={e => upd('name', e.target.value)} placeholder="e.g. Rahul Sharma" style={fieldStyle} />
+      </div>
+
+      <div style={{ marginBottom: 14 }}>
+        <label style={fieldLabelStyle}>Phone Number *</label>
+        <input value={fields.phone || ''} onChange={e => upd('phone', e.target.value)} placeholder="e.g. 9876543210" style={fieldStyle} />
+      </div>
+
+      <div style={{ marginBottom: 14 }}>
+        <label style={fieldLabelStyle}>Address</label>
+        <input value={fields.address || ''} onChange={e => upd('address', e.target.value)} placeholder="e.g. Delhi, India" style={fieldStyle} />
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
+        <div>
+          <label style={fieldLabelStyle}>Join Date</label>
+          <input type="date" value={fields.joinDate || ''} onChange={e => upd('joinDate', e.target.value)} style={fieldStyle} />
+        </div>
+        <div>
+          <label style={fieldLabelStyle}>Seat Number *</label>
+          <select
+            value={fields.seatNumber || ''}
+            onChange={e => upd('seatNumber', e.target.value)}
+            style={fieldStyle}
+          >
+            <option value="">— Select a seat —</option>
+            {freeSeats.map(s => (
+              <option key={s.seatNumber} value={s.seatNumber}>
+                Seat {s.seatNumber}{isEdit && Number(s.seatNumber) === Number(fields.seatNumber) ? ' (current)' : ''}
+              </option>
+            ))}
+          </select>
+          {freeSeats.length === 0 && <p style={{ color: '#f59e0b', fontSize: 11, marginTop: 4 }}>No free seats available</p>}
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
+        <div>
+          <label style={fieldLabelStyle}>Monthly Fee (₹)</label>
+          <input type="number" min="0" value={fields.monthlyFee || ''} onChange={e => upd('monthlyFee', e.target.value)} placeholder="e.g. 1500" style={fieldStyle} />
+        </div>
+        <div>
+          <label style={fieldLabelStyle}>Fee Submission Date</label>
+          <input type="date" value={fields.feeSubmissionDate || ''} onChange={e => upd('feeSubmissionDate', e.target.value)} style={fieldStyle} />
+        </div>
+      </div>
+
+      <div>
+        <label style={fieldLabelStyle}>Fee Status</label>
+        <select value={fields.feeStatus || 'pending'} onChange={e => upd('feeStatus', e.target.value)} style={fieldStyle}>
+          <option value="pending">Pending</option>
+          <option value="paid">Paid</option>
+        </select>
+      </div>
+
+      {err && <p style={{ color: '#ef4444', fontSize: 12, marginTop: 10, fontWeight: 500 }}>{err}</p>}
+    </Modal>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
